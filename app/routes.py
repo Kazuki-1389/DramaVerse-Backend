@@ -1,0 +1,1153 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Coroutine
+import json
+from typing import Annotated
+from typing import Any
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, Security
+from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from app.config import settings
+from app.schemas import DeviceAuthRequest, WatchProgressRequest
+from app.store import state_store
+from app.upstream import capture_device_session, device_id_for_wrapper_token, extract_device_id, get_device_session, proxy_request
+
+
+router = APIRouter()
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def require_client_auth(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer_scheme)] = None,
+    x_device_id: Annotated[
+        str | None,
+        Header(
+            alias="X-Device-Id",
+            description="Legacy fallback. Prefer Authorization: Bearer token from POST /client/auth/device.",
+            examples=["android-install-id-123"],
+        ),
+    ] = None,
+) -> str:
+    if credentials and credentials.scheme.lower() == "bearer":
+        device_id = await device_id_for_wrapper_token(credentials.credentials)
+        if device_id:
+            return device_id
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+
+    if x_device_id:
+        return x_device_id
+
+    raise HTTPException(status_code=401, detail="Missing bearer token")
+
+
+DEVICE_AUTH = [Depends(require_client_auth)]
+
+
+async def proxy_json(request: Request, upstream: str, path: str, extra_query: dict[str, object] | None = None) -> dict[str, Any]:
+    response = await proxy_request(request, upstream, path, extra_query, method_override="GET")
+    body = getattr(response, "body", b"")
+    if isinstance(body, memoryview):
+        body = body.tobytes()
+    if not body:
+        return {}
+    return json.loads(body.decode("utf-8"))
+
+
+async def request_json_body_for_event(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {"value": payload}
+
+
+def film_episodes(film: dict[str, Any]) -> list[dict[str, Any]]:
+    episodes = film.get("episodes")
+    if isinstance(episodes, list):
+        return [episode for episode in episodes if isinstance(episode, dict)]
+
+    episode = film.get("episode") or film.get("episode_watching")
+    return [episode] if isinstance(episode, dict) else []
+
+
+def public_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "episode_id": episode.get("episode_id"),
+        "episode": episode.get("episode"),
+        "title": episode.get("title"),
+        "is_vip": episode.get("is_vip", 0),
+        "price": episode.get("price", 0),
+        "is_unlocked": episode.get("is_unlocked", 1),
+        "is_publish": episode.get("is_publish", 1),
+        "is_like": episode.get("is_like", 0),
+    }
+
+
+def playback_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **public_episode(episode),
+        "playback": {
+            "hls_url": episode.get("link"),
+            "backup_hls_url": episode.get("backup_link"),
+            "subtitles": episode.get("subtitles") if isinstance(episode.get("subtitles"), dict) else {},
+        },
+    }
+
+
+EpisodeRef = Annotated[
+    int,
+    Path(
+        description="Episode number like 1, 2, 3. Episode ids such as 8755 are also accepted.",
+        examples=[1],
+    ),
+]
+
+FilmId = Annotated[int, Path(description="Film/series id.", examples=[167])]
+
+
+def find_episode(episodes: list[dict[str, Any]], episode_ref: int) -> dict[str, Any] | None:
+    for episode in episodes:
+        if episode.get("episode") == episode_ref or episode.get("episode_id") == episode_ref:
+            return episode
+    return None
+
+
+def bool_state(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return True
+        if normalized in {"0", "false", "no"}:
+            return False
+    return None
+
+
+def _state_set(state: dict[str, Any], key: str) -> set[Any]:
+    values = state.get(key)
+    if not isinstance(values, list):
+        return set()
+    return {tuple(value) if isinstance(value, list) else value for value in values}
+
+
+def _dump_state_sets(state: dict[str, set[Any]]) -> dict[str, Any]:
+    return {
+        key: [list(value) if isinstance(value, tuple) else value for value in values]
+        for key, values in state.items()
+    }
+
+
+def persist_in_background(coro: Coroutine[Any, Any, Any]) -> None:
+    task = asyncio.create_task(coro)
+    task.add_done_callback(_consume_background_exception)
+
+
+def _consume_background_exception(task: asyncio.Task[Any]) -> None:
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        return
+
+
+async def engagement_state(device_id: str) -> dict[str, set[Any]]:
+    state = await state_store.get_engagement(device_id)
+    return {
+        "followed_films": _state_set(state, "followed_films"),
+        "unfollowed_films": _state_set(state, "unfollowed_films"),
+        "liked_episodes": _state_set(state, "liked_episodes"),
+        "unliked_episodes": _state_set(state, "unliked_episodes"),
+        "reminded_films": _state_set(state, "reminded_films"),
+        "unreminded_films": _state_set(state, "unreminded_films"),
+    }
+
+
+async def save_engagement_state(device_id: str, state: dict[str, set[Any]]) -> None:
+    await state_store.save_engagement(device_id, _dump_state_sets(state))
+
+
+def episode_key(film_id: int, episode: dict[str, Any]) -> tuple[int, int | str | None]:
+    return film_id, episode.get("episode_id") or episode.get("episode")
+
+
+async def apply_engagement_overrides(device_id: str, film: dict[str, Any]) -> dict[str, Any]:
+    state = await engagement_state(device_id)
+    film_id = film.get("id")
+    if isinstance(film_id, int):
+        if film_id in state["followed_films"]:
+            film["is_follow"] = 1
+        elif film_id in state["unfollowed_films"]:
+            film["is_follow"] = 0
+        if film_id in state["reminded_films"]:
+            film["is_reminder"] = 1
+        elif film_id in state["unreminded_films"]:
+            film["is_reminder"] = 0
+
+        for episode in film_episodes(film):
+            key = episode_key(film_id, episode)
+            if key in state["liked_episodes"]:
+                episode["is_like"] = 1
+            elif key in state["unliked_episodes"]:
+                episode["is_like"] = 0
+
+    return film
+
+
+async def film_payload_with_overrides(request: Request, film_id: int) -> dict[str, Any]:
+    payload = await proxy_json(request, "app", "api/info_film", {"film_id": film_id})
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    device_id = await extract_device_id(request)
+    if film:
+        await apply_engagement_overrides(device_id, film)
+    return payload
+
+WEB_ENDPOINTS = [
+    "GET /api/home_feature -> app /api/film_for_you when no web token is configured",
+    "GET /api/history_watching_film -> app fallback",
+    "GET /api/list_films -> app fallback",
+    "GET /api/user/get_info -> app fallback",
+    "GET /api/film_hot_search -> app /api/film_for_you fallback",
+    "GET /api/info_film -> app fallback",
+    "GET /api/film_languages",
+    "GET /payment/subscription_packages",
+    "GET /payment/coin_packages",
+    "GET /video",
+]
+
+APP_ENDPOINTS = [
+    "POST /auth/user/login",
+    "GET /api/user/get_info",
+    "POST /api/user/update_info",
+    "POST /api/user/device_token",
+    "POST /api/user/user_feedback",
+    "GET /api/get_tags",
+    "GET /api/get_film_by_tags",
+    "GET /api/list_films",
+    "GET /api/film_for_you",
+    "GET /api/info_film",
+    "GET /api/more_like_this",
+    "GET /api/film_list_area",
+    "GET /api/follow_list_film",
+    "POST /api/follow_film",
+    "POST /api/like_film",
+    "POST /api/watching_film",
+    "GET /api/history_watching_film",
+    "GET /api/history_follow_film",
+    "POST /api/unlock_episode",
+    "GET /api/episode_unlocked",
+    "POST /api/toggle_reminder",
+    "GET /api/user_reminders",
+    "GET /api/payment_history_v2",
+    "GET /api/recent_payments",
+    "POST /api/payment_sub2",
+    "GET /api/events",
+    "GET /api/menus",
+    "POST /api/action_events",
+    "POST /api/event_ref",
+    "POST /api/film_click_search",
+]
+
+
+@router.get("/health", include_in_schema=False)
+async def health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "upstreams": {
+            "web": settings.web_base,
+            "app": settings.app_base,
+            "cdn": settings.cdn_base,
+            "default": settings.default_upstream,
+        },
+        "auth": {
+            "mode": "wrapper bearer token from /client/auth/device, env bearer, or generated per-device upstream guest token",
+            "guest_login": f"{settings.app_base}/auth/user/login",
+            "client_auth": "Authorization: Bearer <token>",
+            "legacy_device_headers": ["X-Device-Id", "device_id"],
+        },
+    }
+
+
+@router.get("/endpoints", include_in_schema=False)
+async def endpoints() -> dict[str, object]:
+    return {
+        "web": {
+            "base_route": "/web/{path}",
+            "upstream": settings.web_base,
+            "documented": WEB_ENDPOINTS,
+        },
+        "app": {
+            "base_route": "/app/{path}",
+            "upstream": settings.app_base,
+            "documented": APP_ENDPOINTS,
+        },
+        "cdn": {
+            "base_route": "/cdn/{path}",
+            "upstream": settings.cdn_base,
+            "examples": [
+                "GET /cdn/films/{hash}/index.m3u8",
+                "GET /cdn/subtitles/{hash}.vtt",
+                "GET /cdn/thumbs/{hash}.webp",
+            ],
+        },
+        "compatibility": {
+            "route": "/{path}",
+            "default_upstream": settings.default_upstream,
+            "override_query": "?upstream=web or ?upstream=app",
+        },
+        "device_capture": {
+            "routes": [
+                "POST /device/capture",
+                "POST /auth/device",
+                "POST /api/user/device_token",
+            ],
+            "accepted_device_fields": ["device_id", "deviceId", "device", "uuid", "install_id"],
+            "accepted_headers": ["Authorization: Bearer <token>", "X-Device-Id", "device-id"],
+        },
+    }
+
+
+@router.post("/device/capture", include_in_schema=False)
+async def device_capture(request: Request) -> dict[str, object]:
+    return await capture_device_session(request)
+
+
+@router.post("/auth/device", include_in_schema=False)
+async def auth_device(request: Request) -> dict[str, object]:
+    return await capture_device_session(request)
+
+
+@router.post("/api/user/device_token", include_in_schema=False)
+async def device_token_capture(request: Request) -> dict[str, object]:
+    return await capture_device_session(request)
+
+
+async def auth_user_login(request: Request) -> dict[str, object]:
+    return await capture_device_session(request)
+
+
+async def proxy_app_endpoint(path: str, request: Request) -> Response:
+    return await proxy_request(request, "app", path)
+
+
+async def proxy_web_endpoint(path: str, request: Request) -> Response:
+    return await proxy_request(request, "web", path)
+
+
+def make_proxy_endpoint(
+    upstream: str,
+    path: str,
+) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+    async def endpoint(request: Request) -> Response:
+        return await proxy_request(request, upstream, path)
+
+    endpoint.__name__ = f"{upstream}_{path.replace('/', '_')}"
+    return endpoint
+
+
+def add_proxy_route(
+    method: str,
+    route_path: str,
+    upstream: str,
+    upstream_path: str | None = None,
+    include_in_schema: bool = True,
+) -> None:
+    router.add_api_route(
+        route_path,
+        make_proxy_endpoint(upstream, upstream_path or route_path.lstrip("/")),
+        methods=[method],
+        name=f"{method} {route_path}",
+        include_in_schema=include_in_schema,
+    )
+
+
+router.add_api_route(
+    "/auth/user/login",
+    auth_user_login,
+    methods=["POST"],
+    name="Create Device Guest User",
+    include_in_schema=False,
+)
+
+for route in [
+    "/api/user/update_info",
+    "/api/user/user_feedback",
+    "/api/follow_film",
+    "/api/like_film",
+    "/api/watching_film",
+    "/api/unlock_episode",
+    "/api/toggle_reminder",
+    "/api/payment_sub2",
+    "/api/action_events",
+    "/api/event_ref",
+    "/api/film_click_search",
+]:
+    add_proxy_route("POST", route, "app", include_in_schema=False)
+
+add_proxy_route("POST", "/api/user/get_info", "app", include_in_schema=False)
+
+for route in [
+    "/api/user/get_info",
+    "/api/history_follow_film",
+    "/api/get_tags",
+    "/api/get_film_by_tags",
+    "/api/list_films",
+    "/api/film_for_you",
+    "/api/info_film",
+    "/api/more_like_this",
+    "/api/film_list_area",
+    "/api/follow_list_film",
+    "/api/history_watching_film",
+    "/api/episode_unlocked",
+    "/api/user_reminders",
+    "/api/payment_history_v2",
+    "/api/recent_payments",
+    "/api/events",
+    "/api/menus",
+]:
+    add_proxy_route("GET", route, "app", include_in_schema=False)
+
+for route, upstream_path in [
+    ("/api/home_feature", "api/home_feature"),
+    ("/api/film_hot_search", "api/film_hot_search"),
+    ("/api/film_languages", "api/film_languages"),
+    ("/payment/subscription_packages", "payment/subscription_packages"),
+    ("/payment/coin_packages", "payment/coin_packages"),
+    ("/video", "video"),
+]:
+    add_proxy_route("GET", route, "web", upstream_path, include_in_schema=False)
+
+
+@router.post(
+    "/client/auth/device",
+    tags=["Auth"],
+    summary="Register or resume a device user",
+)
+async def client_auth_device(_: DeviceAuthRequest, request: Request) -> dict[str, object]:
+    return await capture_device_session(request)
+
+
+@router.get("/client/me", tags=["User"], summary="Get current device user", dependencies=DEVICE_AUTH)
+async def client_me(request: Request) -> Response:
+    device_id = await extract_device_id(request)
+    session = await get_device_session(device_id)
+    user = session.get("user") if isinstance(session.get("user"), dict) else {}
+    return await proxy_request(request, "app", "api/user/get_info", {"auth_id": user.get("id")})
+
+
+@router.post(
+    "/client/me",
+    tags=["User"],
+    summary="Update current device user",
+    dependencies=DEVICE_AUTH,
+    include_in_schema=False,
+)
+async def client_update_me(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/user/update_info")
+
+
+@router.post("/client/feedback", tags=["User"], summary="Send user feedback", dependencies=DEVICE_AUTH)
+async def client_feedback(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/user/user_feedback")
+
+
+@router.get("/client/home", tags=["Discovery"], summary="Home feed", dependencies=DEVICE_AUTH)
+async def client_home(request: Request) -> Response:
+    return await proxy_request(request, "web", "api/home_feature")
+
+
+@router.get("/client/for-you", tags=["Discovery"], summary="Personalized film feed", dependencies=DEVICE_AUTH)
+async def client_for_you(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/film_for_you")
+
+
+@router.get("/client/search", tags=["Discovery"], summary="Search films", dependencies=DEVICE_AUTH)
+async def client_search(
+    request: Request,
+    query: str = Query(..., min_length=1, description="Search text typed by the user."),
+) -> Response:
+    return await proxy_request(request, "app", "api/list_films", {"s": query})
+
+
+@router.get("/client/search/hot", tags=["Discovery"], summary="Hot search films", dependencies=DEVICE_AUTH)
+async def client_hot_search(request: Request) -> Response:
+    return await proxy_request(request, "web", "api/film_hot_search")
+
+
+@router.get("/client/tags", tags=["Discovery"], summary="List tags", dependencies=DEVICE_AUTH)
+async def client_tags(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/get_tags")
+
+
+@router.get(
+    "/client/tags/{tag_id}/films",
+    tags=["Discovery"],
+    summary="Films for a selected tag",
+    dependencies=DEVICE_AUTH,
+)
+async def client_tag_films(tag_id: int, request: Request) -> Response:
+    return await proxy_request(request, "app", "api/get_film_by_tags", {"tag_id": tag_id})
+
+
+@router.get(
+    "/client/areas",
+    tags=["Discovery"],
+    summary="Film areas",
+    dependencies=DEVICE_AUTH,
+    include_in_schema=False,
+)
+async def client_areas(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/film_list_area")
+
+
+@router.get(
+    "/client/areas/{slug}/films",
+    tags=["Discovery"],
+    summary="Films for a selected area",
+    dependencies=DEVICE_AUTH,
+    include_in_schema=False,
+)
+async def client_area_films(slug: str, request: Request) -> Response:
+    return await proxy_request(request, "app", "api/film_list_area", {"slug": slug})
+
+
+@router.get("/client/films", tags=["Films"], summary="List films", dependencies=DEVICE_AUTH)
+async def client_films(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/list_films")
+
+
+@router.get("/client/films/{film_id}", tags=["Films"], summary="Film details", dependencies=DEVICE_AUTH)
+async def client_film_detail(film_id: int, request: Request) -> JSONResponse:
+    return JSONResponse(await film_payload_with_overrides(request, film_id))
+
+
+@router.get(
+    "/client/films/{film_id}/episodes",
+    tags=["Playback"],
+    summary="List episodes for a film",
+    dependencies=DEVICE_AUTH,
+)
+async def client_film_episodes(film_id: FilmId, request: Request) -> JSONResponse:
+    payload = await film_payload_with_overrides(request, film_id)
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    episodes = film_episodes(film)
+    return JSONResponse(
+        {
+            "status": payload.get("status", False),
+            "film_id": film_id,
+            "episode_total": film.get("episode_total") or len(episodes),
+            "episodes": [public_episode(episode) for episode in episodes],
+        }
+    )
+
+
+@router.get(
+    "/client/films/{film_id}/episodes/{episode_number}/play",
+    tags=["Playback"],
+    summary="Get HLS playback info for an episode",
+    dependencies=DEVICE_AUTH,
+)
+async def client_play_episode(film_id: FilmId, episode_number: EpisodeRef, request: Request) -> JSONResponse:
+    payload = await proxy_json(request, "app", "api/info_film", {"film_id": film_id})
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    episodes = film_episodes(film)
+    episode = find_episode(episodes, episode_number)
+    if not episode:
+        return JSONResponse(
+            {"status": False, "message": "Episode not found", "film_id": film_id, "episode": episode_number},
+            status_code=404,
+        )
+
+    current_index = episodes.index(episode)
+    next_episode = episodes[current_index + 1] if current_index + 1 < len(episodes) else None
+    is_paid = bool(episode.get("is_vip")) or int(episode.get("price") or 0) > 0
+    unlocked = episode.get("is_unlocked", 1) == 1 or not is_paid
+
+    return JSONResponse(
+        {
+            "status": True,
+            "film": {
+                "id": film.get("id"),
+                "title": film.get("title"),
+                "thumb": film.get("thumb"),
+                "episode_total": film.get("episode_total") or len(episodes),
+            },
+            "episode": playback_episode(episode),
+            "next_episode": public_episode(next_episode) if isinstance(next_episode, dict) else None,
+            "unlock_required": not unlocked,
+        }
+    )
+
+
+@router.post(
+    "/client/films/{film_id}/episodes/{episode_number}/watch",
+    tags=["Playback"],
+    summary="Save episode watch progress",
+    dependencies=DEVICE_AUTH,
+)
+async def client_watch_episode(
+    film_id: FilmId,
+    episode_number: EpisodeRef,
+    progress: WatchProgressRequest,
+    request: Request,
+) -> Response:
+    device_id = await extract_device_id(request)
+    persist_in_background(
+        state_store.save_watch_progress(
+            device_id,
+            film_id,
+            episode_number,
+            {
+                "progress_seconds": progress.progress_seconds,
+                "duration_seconds": progress.duration_seconds,
+                "completed": progress.completed,
+            },
+        )
+    )
+    payload = await proxy_json(request, "app", "api/info_film", {"film_id": film_id})
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    episode = find_episode(film_episodes(film), episode_number)
+    return await proxy_request(
+        request,
+        "app",
+        "api/watching_film",
+        {
+            "film_id": film_id,
+            "episode": episode_number,
+            "episode_id": episode.get("episode_id") if episode else None,
+            "current_time": progress.progress_seconds,
+            "time_watching": progress.progress_seconds,
+            "watched_duration": progress.progress_seconds,
+            "episode_duration": progress.duration_seconds,
+            "is_completed": 1 if progress.completed else 0,
+        },
+    )
+
+
+@router.post(
+    "/client/films/{film_id}/episodes/{episode_number}/unlock",
+    tags=["Playback"],
+    summary="Unlock a locked episode",
+    dependencies=DEVICE_AUTH,
+)
+async def client_unlock_film_episode(film_id: FilmId, episode_number: EpisodeRef, request: Request) -> Response:
+    payload = await proxy_json(request, "app", "api/info_film", {"film_id": film_id})
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    episode = find_episode(film_episodes(film), episode_number)
+    if not episode:
+        return JSONResponse(
+            {"status": False, "message": "Episode not found", "film_id": film_id, "episode": episode_number},
+            status_code=404,
+        )
+
+    is_paid = bool(episode.get("is_vip")) or int(episode.get("price") or 0) > 0
+    is_unlocked = episode.get("is_unlocked", 1) == 1 or not is_paid
+    if is_unlocked:
+        return JSONResponse(
+            {
+                "status": True,
+                "message": "Episode is already playable.",
+                "film_id": film_id,
+                "episode": public_episode(episode),
+                "is_unlocked": True,
+                "unlock_required": False,
+            }
+        )
+
+    return await proxy_request(
+        request,
+        "app",
+        "api/unlock_episode",
+        {
+            "film_id": film_id,
+            "episode": episode_number,
+            "episode_id": episode.get("episode_id") if episode else None,
+        },
+    )
+
+
+@router.get(
+    "/client/films/{film_id}/similar",
+    tags=["Films"],
+    summary="More like this",
+    dependencies=DEVICE_AUTH,
+)
+async def client_more_like_this(film_id: int, request: Request) -> Response:
+    return await proxy_request(request, "app", "api/more_like_this", {"film_id": film_id})
+
+
+@router.post(
+    "/client/films/{film_id}/follow",
+    tags=["Engagement"],
+    summary="Follow a film",
+    dependencies=DEVICE_AUTH,
+)
+async def client_follow_film(film_id: int, request: Request) -> Response:
+    return await set_film_follow_state(film_id, request, True)
+
+
+@router.post(
+    "/client/films/{film_id}/unfollow",
+    tags=["Engagement"],
+    summary="Unfollow a film",
+    dependencies=DEVICE_AUTH,
+)
+async def client_unfollow_film(film_id: int, request: Request) -> Response:
+    return await set_film_follow_state(film_id, request, False)
+
+
+async def set_film_follow_state(film_id: int, request: Request, should_follow: bool) -> Response:
+    payload = await film_payload_with_overrides(request, film_id)
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    current = bool_state(film.get("is_follow"))
+    if current is should_follow:
+        return JSONResponse(
+            {
+                "status": True,
+                "message": "Film already followed." if should_follow else "Film already unfollowed.",
+                "data": film,
+            }
+        )
+
+    await proxy_request(request, "app", "api/follow_film", {"film_id": film_id})
+    device_id = await extract_device_id(request)
+    state = await engagement_state(device_id)
+    if should_follow:
+        state["followed_films"].add(film_id)
+        state["unfollowed_films"].discard(film_id)
+        film["is_follow"] = 1
+    else:
+        state["unfollowed_films"].add(film_id)
+        state["followed_films"].discard(film_id)
+        film["is_follow"] = 0
+    await save_engagement_state(device_id, state)
+
+    return JSONResponse(
+        {
+            "status": True,
+            "message": "Follow Film Success!" if should_follow else "Unfollow Film Success!",
+            "data": film,
+        }
+    )
+
+
+@router.post(
+    "/client/films/{film_id}/like",
+    tags=["Engagement"],
+    summary="Like the first/current episode for a film",
+    dependencies=DEVICE_AUTH,
+)
+async def client_like_film(film_id: int, request: Request) -> Response:
+    return await set_film_episode_like_state(film_id, None, request, True)
+
+
+@router.post(
+    "/client/films/{film_id}/unlike",
+    tags=["Engagement"],
+    summary="Unlike the first/current episode for a film",
+    dependencies=DEVICE_AUTH,
+)
+async def client_unlike_film(film_id: int, request: Request) -> Response:
+    return await set_film_episode_like_state(film_id, None, request, False)
+
+
+@router.post(
+    "/client/films/{film_id}/episodes/{episode_number}/like",
+    tags=["Engagement"],
+    summary="Like one episode",
+    dependencies=DEVICE_AUTH,
+)
+async def client_like_episode(film_id: FilmId, episode_number: EpisodeRef, request: Request) -> Response:
+    return await set_film_episode_like_state(film_id, episode_number, request, True)
+
+
+@router.post(
+    "/client/films/{film_id}/episodes/{episode_number}/unlike",
+    tags=["Engagement"],
+    summary="Unlike one episode",
+    dependencies=DEVICE_AUTH,
+)
+async def client_unlike_episode(film_id: FilmId, episode_number: EpisodeRef, request: Request) -> Response:
+    return await set_film_episode_like_state(film_id, episode_number, request, False)
+
+
+async def set_film_episode_like_state(
+    film_id: int,
+    episode_number: int | None,
+    request: Request,
+    should_like: bool,
+) -> Response:
+    payload = await film_payload_with_overrides(request, film_id)
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    episodes = film_episodes(film)
+    episode = find_episode(episodes, episode_number) if episode_number is not None else (episodes[0] if episodes else None)
+    if not episode:
+        return JSONResponse(
+            {"status": False, "message": "Episode not found", "film_id": film_id, "episode": episode_number or 1},
+            status_code=404,
+        )
+
+    current = bool_state(episode.get("is_like"))
+    if current is should_like:
+        return JSONResponse(
+            {
+                "status": True,
+                "message": "Episode already liked." if should_like else "Episode already unliked.",
+                "data": {
+                    "film": film,
+                    "episode": public_episode(episode) | {"is_like": episode.get("is_like")},
+                },
+            }
+        )
+
+    await proxy_request(
+        request,
+        "app",
+        "api/like_film",
+        {
+            "film_id": film_id,
+            "episode_id": episode.get("episode_id"),
+        },
+    )
+    device_id = await extract_device_id(request)
+    state = await engagement_state(device_id)
+    key = episode_key(film_id, episode)
+    if should_like:
+        state["liked_episodes"].add(key)
+        state["unliked_episodes"].discard(key)
+        episode["is_like"] = 1
+    else:
+        state["unliked_episodes"].add(key)
+        state["liked_episodes"].discard(key)
+        episode["is_like"] = 0
+    await save_engagement_state(device_id, state)
+
+    return JSONResponse(
+        {
+            "status": True,
+            "message": "Like Episode Success!" if should_like else "Unlike Episode Success!",
+            "data": {
+                "film": film,
+                "episode": public_episode(episode),
+            },
+        }
+    )
+
+
+async def followed_library_response(request: Request) -> JSONResponse:
+    device_id = await extract_device_id(request)
+    state = await engagement_state(device_id)
+    payload = await proxy_json(request, "app", "api/history_follow_film")
+    upstream_items = payload.get("data") if isinstance(payload.get("data"), list) else []
+    films: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    for item in upstream_items:
+        if not isinstance(item, dict):
+            continue
+        film_id = item.get("id") or item.get("film_id")
+        if isinstance(film_id, int) and film_id in state["unfollowed_films"]:
+            continue
+        if isinstance(film_id, int):
+            seen.add(film_id)
+        films.append(await apply_engagement_overrides(device_id, item))
+
+    for film_id in sorted(value for value in state["followed_films"] if isinstance(value, int)):
+        if film_id in seen:
+            continue
+        film_payload = await film_payload_with_overrides(request, film_id)
+        film = film_payload.get("data") if isinstance(film_payload.get("data"), dict) else None
+        if film:
+            films.append(film)
+
+    return JSONResponse(
+        {
+            "status": True,
+            "message": payload.get("message"),
+            "data": films,
+        }
+    )
+
+
+@router.get("/client/library/following", tags=["Library"], summary="Followed films", dependencies=DEVICE_AUTH)
+async def client_following(request: Request) -> JSONResponse:
+    return await followed_library_response(request)
+
+
+@router.get("/client/history/watch", tags=["Library"], summary="Watch history", dependencies=DEVICE_AUTH)
+async def client_watch_history(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/history_watching_film")
+
+
+@router.get("/client/history/follow", tags=["Library"], summary="Follow history", dependencies=DEVICE_AUTH)
+async def client_follow_history(request: Request) -> JSONResponse:
+    return await followed_library_response(request)
+
+
+@router.post(
+    "/client/films/{film_id}/reminder",
+    tags=["Reminders"],
+    summary="Set a film reminder",
+    dependencies=DEVICE_AUTH,
+)
+async def client_set_film_reminder(film_id: FilmId, request: Request) -> Response:
+    return await set_film_reminder_state(film_id, request, True)
+
+
+@router.post(
+    "/client/films/{film_id}/unreminder",
+    tags=["Reminders"],
+    summary="Remove a film reminder",
+    dependencies=DEVICE_AUTH,
+)
+async def client_remove_film_reminder(film_id: FilmId, request: Request) -> Response:
+    return await set_film_reminder_state(film_id, request, False)
+
+
+async def set_film_reminder_state(film_id: int, request: Request, should_remind: bool) -> Response:
+    payload = await film_payload_with_overrides(request, film_id)
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {"id": film_id}
+    current = bool_state(film.get("is_reminder"))
+    if current is should_remind:
+        return JSONResponse(
+            {
+                "status": True,
+                "message": "Reminder already set." if should_remind else "Reminder already removed.",
+                "data": {"film_id": film_id, "is_active": 1 if should_remind else 0, "film": film},
+            }
+        )
+
+    await proxy_request(request, "app", "api/toggle_reminder", {"film_id": film_id})
+    device_id = await extract_device_id(request)
+    state = await engagement_state(device_id)
+    if should_remind:
+        state["reminded_films"].add(film_id)
+        state["unreminded_films"].discard(film_id)
+        film["is_reminder"] = 1
+    else:
+        state["unreminded_films"].add(film_id)
+        state["reminded_films"].discard(film_id)
+        film["is_reminder"] = 0
+    await save_engagement_state(device_id, state)
+
+    return JSONResponse(
+        {
+            "status": True,
+            "message": "Reminder added successfully" if should_remind else "Reminder removed successfully",
+            "data": {"film_id": film_id, "is_active": 1 if should_remind else 0, "film": film},
+        }
+    )
+
+
+async def reminders_response(request: Request) -> JSONResponse:
+    device_id = await extract_device_id(request)
+    state = await engagement_state(device_id)
+    payload = await proxy_json(request, "app", "api/user_reminders")
+    upstream_items = payload.get("data") if isinstance(payload.get("data"), list) else []
+    reminders: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    for item in upstream_items:
+        if not isinstance(item, dict):
+            continue
+        film_id = item.get("film_id") or item.get("id")
+        if isinstance(film_id, int) and film_id in state["unreminded_films"]:
+            continue
+        if isinstance(film_id, int):
+            seen.add(film_id)
+            film_payload = await film_payload_with_overrides(request, film_id)
+            film = film_payload.get("data") if isinstance(film_payload.get("data"), dict) else None
+            reminders.append(
+                {
+                    **item,
+                    "film_id": film_id,
+                    "is_active": item.get("is_active", 1),
+                    "film": film,
+                }
+            )
+        else:
+            reminders.append(item)
+
+    for film_id in sorted(value for value in state["reminded_films"] if isinstance(value, int)):
+        if film_id in seen:
+            continue
+        film_payload = await film_payload_with_overrides(request, film_id)
+        film = film_payload.get("data") if isinstance(film_payload.get("data"), dict) else {"id": film_id}
+        reminders.append({"film_id": film_id, "is_active": 1, "film": film})
+
+    return JSONResponse({"status": True, "message": payload.get("message"), "data": reminders})
+
+
+@router.get(
+    "/client/films/{film_id}/episodes/unlocked",
+    tags=["Playback"],
+    summary="Unlocked episodes for a film",
+    dependencies=DEVICE_AUTH,
+)
+async def client_film_unlocked_episodes(film_id: FilmId, request: Request) -> Response:
+    return await proxy_request(request, "app", "api/episode_unlocked", {"film_id": film_id})
+
+
+@router.get(
+    "/client/films/{film_id}/episodes/{episode_number}/unlock-state",
+    tags=["Playback"],
+    summary="Check unlock state for one episode",
+    dependencies=DEVICE_AUTH,
+)
+async def client_episode_unlock_state(film_id: FilmId, episode_number: EpisodeRef, request: Request) -> JSONResponse:
+    payload = await proxy_json(request, "app", "api/info_film", {"film_id": film_id})
+    film = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    episode = find_episode(film_episodes(film), episode_number)
+    if not episode:
+        return JSONResponse(
+            {"status": False, "message": "Episode not found", "film_id": film_id, "episode": episode_number},
+            status_code=404,
+        )
+
+    is_paid = bool(episode.get("is_vip")) or int(episode.get("price") or 0) > 0
+    is_unlocked = episode.get("is_unlocked", 1) == 1 or not is_paid
+    return JSONResponse(
+        {
+            "status": True,
+            "film_id": film_id,
+            "episode": public_episode(episode),
+            "is_unlocked": is_unlocked,
+            "unlock_required": not is_unlocked,
+        }
+    )
+
+
+@router.post(
+    "/client/reminders/toggle",
+    tags=["Reminders"],
+    summary="Toggle reminder",
+    dependencies=DEVICE_AUTH,
+    include_in_schema=False,
+)
+async def client_toggle_reminder(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/toggle_reminder")
+
+
+@router.get("/client/reminders", tags=["Reminders"], summary="User reminders", dependencies=DEVICE_AUTH)
+async def client_reminders(request: Request) -> JSONResponse:
+    return await reminders_response(request)
+
+
+@router.get("/client/payments/packages/coins", tags=["Payments"], summary="Coin packages", dependencies=DEVICE_AUTH)
+async def client_coin_packages(request: Request) -> Response:
+    return await proxy_request(request, "web", "payment/coin_packages")
+
+
+@router.get(
+    "/client/payments/packages/subscriptions",
+    tags=["Payments"],
+    summary="Subscription packages",
+    dependencies=DEVICE_AUTH,
+)
+async def client_subscription_packages(request: Request) -> Response:
+    return await proxy_request(request, "web", "payment/subscription_packages")
+
+
+@router.get("/client/payments/history", tags=["Payments"], summary="Payment history", dependencies=DEVICE_AUTH)
+async def client_payment_history(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/payment_history_v2")
+
+
+@router.get("/client/payments/recent", tags=["Payments"], summary="Recent payments", dependencies=DEVICE_AUTH)
+async def client_recent_payments(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/recent_payments")
+
+
+@router.post(
+    "/client/payments/subscribe",
+    tags=["Payments"],
+    summary="Create subscription payment",
+    dependencies=DEVICE_AUTH,
+)
+async def client_payment_subscribe(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/payment_sub2")
+
+
+@router.get("/client/events", tags=["Events"], summary="App events", dependencies=DEVICE_AUTH)
+async def client_events(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/events")
+
+
+@router.post("/client/events/action", tags=["Events"], summary="Send action event", dependencies=DEVICE_AUTH)
+async def client_action_event(request: Request) -> Response:
+    device_id = await extract_device_id(request)
+    payload = await request_json_body_for_event(request)
+    persist_in_background(state_store.save_event(device_id, "action", payload))
+    return await proxy_request(request, "app", "api/action_events")
+
+
+@router.post("/client/events/ref", tags=["Events"], summary="Send event ref", dependencies=DEVICE_AUTH)
+async def client_event_ref(request: Request) -> Response:
+    device_id = await extract_device_id(request)
+    payload = await request_json_body_for_event(request)
+    persist_in_background(state_store.save_event(device_id, "ref", payload))
+    return await proxy_request(request, "app", "api/event_ref")
+
+
+@router.get("/client/config/menus", tags=["Config"], summary="App menus", dependencies=DEVICE_AUTH)
+async def client_menus(request: Request) -> Response:
+    return await proxy_request(request, "app", "api/menus")
+
+
+@router.get("/client/config/languages", tags=["Config"], summary="Film languages", dependencies=DEVICE_AUTH)
+async def client_languages(request: Request) -> Response:
+    return await proxy_request(request, "web", "api/film_languages")
+
+
+@router.get(
+    "/client/video-page",
+    tags=["Video"],
+    summary="Video page shell",
+    dependencies=DEVICE_AUTH,
+    include_in_schema=False,
+)
+async def client_video_page(request: Request) -> Response:
+    return await proxy_request(request, "web", "video")
+
+
+@router.api_route(
+    "/web/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+async def web_proxy(path: str, request: Request) -> Response:
+    return await proxy_request(request, "web", path)
+
+
+@router.api_route(
+    "/app/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+async def app_proxy(path: str, request: Request) -> Response:
+    return await proxy_request(request, "app", path)
+
+
+@router.api_route("/cdn/{path:path}", methods=["GET", "HEAD", "OPTIONS"], include_in_schema=False)
+async def cdn_proxy(path: str, request: Request) -> Response:
+    return await proxy_request(request, "cdn", path)
+
+
+@router.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+async def compatibility_proxy(path: str, request: Request) -> Response:
+    if path in {"", "favicon.ico"}:
+        return JSONResponse({"status": "ok", "message": "DramaHub wrapper is running"})
+
+    upstream = request.query_params.get("upstream") or request.query_params.get("source")
+    if upstream not in {"web", "app"}:
+        upstream = settings.default_upstream if settings.default_upstream in {"web", "app"} else "web"
+
+    return await proxy_request(request, upstream, path)
