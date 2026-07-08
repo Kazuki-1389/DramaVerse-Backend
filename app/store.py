@@ -7,8 +7,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from app.env import load_env_file
+
+
+load_env_file()
 
 JsonMap = dict[str, Any]
+state_store_backend = "memory"
+state_store_error: str | None = None
 
 
 def utc_now_iso() -> str:
@@ -189,15 +195,20 @@ class FirestoreStateStore(StateStore):
 
 
 def build_state_store() -> StateStore:
+    global state_store_backend, state_store_error
     use_firestore = os.getenv("FIRESTORE_ENABLED", "").lower() in {"1", "true", "yes"} or bool(
         os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("FIREBASE_PROJECT_ID")
     )
     if not use_firestore:
+        state_store_backend = "memory"
+        state_store_error = None
         return MemoryStateStore()
 
     try:
         from google.cloud import firestore
     except ImportError:
+        state_store_backend = "memory"
+        state_store_error = "google-cloud-firestore is not installed"
         return MemoryStateStore()
 
     project = os.getenv("FIREBASE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or None
@@ -207,8 +218,12 @@ def build_state_store() -> StateStore:
         client_kwargs["database"] = database
     try:
         client = firestore.Client(**client_kwargs)
-    except Exception:
+    except Exception as exc:
+        state_store_backend = "memory"
+        state_store_error = f"{type(exc).__name__}: {exc}"
         return MemoryStateStore()
+    state_store_backend = "firestore"
+    state_store_error = None
     return FirestoreStateStore(client, os.getenv("FIRESTORE_COLLECTION_PREFIX", "dramaverse"))
 
 

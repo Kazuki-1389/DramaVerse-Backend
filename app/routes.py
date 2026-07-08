@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Coroutine
 import json
+import os
 from typing import Annotated
 from typing import Any
 
@@ -12,7 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import settings
 from app.schemas import DeviceAuthRequest, WatchProgressRequest
-from app.store import state_store
+from app.store import state_store, state_store_backend, state_store_error
 from app.upstream import capture_device_session, device_id_for_wrapper_token, extract_device_id, get_device_session, proxy_request
 
 
@@ -268,6 +269,12 @@ async def health() -> dict[str, object]:
             "guest_login": f"{settings.app_base}/auth/user/login",
             "client_auth": "Authorization: Bearer <token>",
             "legacy_device_headers": ["X-Device-Id", "device_id"],
+        },
+        "store": {
+            "backend": state_store_backend,
+            "firestore_project": os.getenv("FIREBASE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT"),
+            "collection_prefix": os.getenv("FIRESTORE_COLLECTION_PREFIX", "dramaverse"),
+            "error": state_store_error,
         },
     }
 

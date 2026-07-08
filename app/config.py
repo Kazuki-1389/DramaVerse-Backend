@@ -4,6 +4,11 @@ import os
 import uuid
 from dataclasses import dataclass
 
+from app.env import load_env_file
+
+
+load_env_file()
+
 
 def _clean_base_url(value: str) -> str:
     return value.rstrip("/")
