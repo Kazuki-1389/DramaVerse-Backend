@@ -76,9 +76,10 @@ def film_episodes(film: dict[str, Any]) -> list[dict[str, Any]]:
 
 def public_episode(episode: dict[str, Any]) -> dict[str, Any]:
     unlocked = episode_is_unlocked(episode)
+    episode_number = episode_number_value(episode)
     return {
         "episode_id": episode.get("episode_id"),
-        "episode": episode.get("episode"),
+        "episode": episode.get("episode") or episode_number,
         "title": episode.get("title"),
         "is_vip": 1 if episode_is_paid(episode) else 0,
         "price": episode.get("price", 0),
@@ -113,7 +114,7 @@ FilmId = Annotated[int, Path(description="Film/series id.", examples=[167])]
 
 def find_episode(episodes: list[dict[str, Any]], episode_ref: int) -> dict[str, Any] | None:
     for episode in episodes:
-        if episode.get("episode") == episode_ref or episode.get("episode_id") == episode_ref:
+        if episode_number_value(episode) == episode_ref or int_value(episode.get("episode_id"), -1) == episode_ref:
             return episode
     return None
 
@@ -159,15 +160,16 @@ def episode_is_paid(episode: dict[str, Any]) -> bool:
 
 
 def episode_is_unlocked(episode: dict[str, Any]) -> bool:
+    if episode_number_value(episode) <= 1:
+        return True
+
     explicit = next(
         (parsed for key in ("is_unlocked", "unlocked") if (parsed := bool_state(episode.get(key))) is not None),
         None,
     )
     if explicit is not None:
         return explicit
-    if episode_number_value(episode) <= 1:
-        return True
-    return not episode_is_paid(episode)
+    return False
 
 
 def _state_set(state: dict[str, Any], key: str) -> set[Any]:

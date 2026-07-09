@@ -13,6 +13,7 @@ from app.upstream import (
     prepare_headers,
     should_use_app_fallback,
 )
+from app.routes import episode_is_unlocked, find_episode
 
 
 class DummyRequest:
@@ -155,6 +156,18 @@ class WrapperTests(unittest.TestCase):
         response = TestClient(app).get("/client/me")
 
         self.assertEqual(response.status_code, 401)
+
+    def test_episode_one_is_always_unlocked_and_later_episodes_follow_upstream_flag(self):
+        episodes = [
+            {"episode": "1", "is_unlocked": 0},
+            {"episode": "2", "is_unlocked": 0},
+            {"episode": "3", "is_unlocked": 1},
+        ]
+
+        self.assertIs(find_episode(episodes, 1), episodes[0])
+        self.assertTrue(episode_is_unlocked(episodes[0]))
+        self.assertFalse(episode_is_unlocked(episodes[1]))
+        self.assertTrue(episode_is_unlocked(episodes[2]))
 
 
 def asyncio_run(awaitable):
