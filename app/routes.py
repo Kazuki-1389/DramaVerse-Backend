@@ -1120,6 +1120,7 @@ def reward_payload(device_id: str, rewards: dict[str, Any]) -> dict[str, Any]:
         claimed_tasks = []
     current_day = int_value(rewards.get("check_in_day"), 1) or 1
     current_day = min(max(current_day, 1), 7)
+    last_claimed_check_in_day = int_value(rewards.get("last_claimed_check_in_day"), 0)
     last_spin_week = rewards.get("last_spin_week")
     watch_minutes = int_value(rewards.get("watch_minutes_today"), 0) if rewards.get("watch_minutes_day") == today else 0
     return {
@@ -1132,8 +1133,8 @@ def reward_payload(device_id: str, rewards: dict[str, Any]) -> dict[str, Any]:
             {
                 "day": index + 1,
                 "reward": reward,
-                "claimed": rewards.get("last_check_in") == today and index + 1 == current_day,
-                "current": index + 1 == current_day,
+                "claimed": rewards.get("last_check_in") == today and index + 1 == last_claimed_check_in_day,
+                "current": rewards.get("last_check_in") != today and index + 1 == current_day,
             }
             for index, reward in enumerate(CHECK_IN_REWARDS)
         ],
@@ -1312,6 +1313,7 @@ async def client_reward_action(action: RewardActionRequest, request: Request) ->
             current_day = min(max(int_value(rewards.get("check_in_day"), 1), 1), 7)
             earned = CHECK_IN_REWARDS[current_day - 1]
             rewards["last_check_in"] = today
+            rewards["last_claimed_check_in_day"] = current_day
             rewards["check_in_day"] = 1 if current_day >= 7 else current_day + 1
             message = f"Daily check-in claimed: +{earned} coins."
         else:
