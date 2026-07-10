@@ -57,6 +57,18 @@ async def proxy_json(request: Request, upstream: str, path: str, extra_query: di
     return json.loads(body.decode("utf-8"))
 
 
+async def optional_proxy_json(
+    request: Request,
+    upstream: str,
+    path: str,
+    extra_query: dict[str, object] | None = None,
+) -> dict[str, Any]:
+    try:
+        return await proxy_json(request, upstream, path, extra_query)
+    except Exception:
+        return {}
+
+
 async def request_json_body_for_event(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
@@ -1068,6 +1080,35 @@ async def reminders_response(request: Request) -> JSONResponse:
     return JSONResponse({"status": True, "message": payload.get("message"), "data": reminders})
 
 
+def package_data_or_default(payload: dict[str, Any], default: list[dict[str, Any]]) -> Any:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, list) and data:
+        return data
+    if isinstance(data, dict) and data:
+        return data
+    if isinstance(payload, dict) and payload:
+        return payload
+    return default
+
+
+def default_coin_packages() -> list[dict[str, Any]]:
+    return [
+        {"title": "50 Coins", "coins": 50, "price": "$0.99"},
+        {"title": "100 Coins", "coins": 100, "price": "$1.99"},
+        {"title": "250 Coins", "coins": 250, "price": "$4.99"},
+        {"title": "500 Coins", "coins": 500, "price": "$8.99"},
+        {"title": "1000 Coins Pack", "coins": 1000, "price": "$14.99", "best_value": True},
+    ]
+
+
+def default_subscription_packages() -> list[dict[str, Any]]:
+    return [
+        {"title": "Monthly", "price": "$10.99", "period": "month"},
+        {"title": "Yearly", "price": "$100.99", "period": "year", "best_value": True},
+        {"title": "Weekly", "price": "$4.99", "period": "week"},
+    ]
+
+
 @router.get(
     "/client/films/{film_id}/episodes/unlocked",
     tags=["Playback"],
@@ -1203,15 +1244,15 @@ async def client_read_notification(notification_id: str, request: Request) -> JS
 async def client_rewards(request: Request) -> JSONResponse:
     device_id = await extract_device_id(request)
     rewards = await state_store.get_rewards(device_id)
-    coin_packages = await proxy_json(request, "web", "payment/coin_packages")
-    subscription_packages = await proxy_json(request, "web", "payment/subscription_packages")
+    coin_packages = await optional_proxy_json(request, "web", "payment/coin_packages")
+    subscription_packages = await optional_proxy_json(request, "web", "payment/subscription_packages")
     return JSONResponse(
         {
             "status": True,
             "data": {
                 **rewards,
-                "coin_packages": coin_packages.get("data", coin_packages),
-                "subscription_packages": subscription_packages.get("data", subscription_packages),
+                "coin_packages": package_data_or_default(coin_packages, default_coin_packages()),
+                "subscription_packages": package_data_or_default(subscription_packages, default_subscription_packages()),
             },
         }
     )
@@ -1238,7 +1279,16 @@ async def client_reward_action(action: RewardActionRequest, request: Request) ->
             "metadata": {"action": action.action},
         },
     )
-    return JSONResponse({"status": True, "data": rewards})
+    return JSONResponse(
+        {
+            "status": True,
+            "data": {
+                **rewards,
+                "coin_packages": default_coin_packages(),
+                "subscription_packages": default_subscription_packages(),
+            },
+        }
+    )
 
 
 @router.get("/client/payments/packages/coins", tags=["Payments"], summary="Coin packages", dependencies=DEVICE_AUTH)
