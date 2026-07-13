@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
+import io
 import json
 import os
+import struct
 from typing import Annotated
 from typing import Any
+from urllib.parse import quote
+import zlib
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, Security
 from fastapi.responses import JSONResponse, Response
@@ -209,6 +213,79 @@ def _consume_background_exception(task: asyncio.Task[Any]) -> None:
         task.exception()
     except asyncio.CancelledError:
         return
+
+
+def first_string(value: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return str(raw)
+    return ""
+
+
+def profile_payload(request: Request, device_id: str, user: dict[str, Any], upstream: dict[str, Any] | None = None) -> dict[str, Any]:
+    guest_id = first_string(user, "id", "user_id", "uid", "auth_id", "guest_id").strip() or device_id
+    display_name = first_string(user, "name", "username", "user_name", "nick_name", "nickname", "display_name")
+    if not display_name:
+        display_name = f"Guest {guest_id[-6:]}" if len(guest_id) > 6 else f"Guest {guest_id}"
+    avatar_url = first_string(user, "avatar", "avatar_url", "profile_pic", "profile_picture", "photo", "image")
+    if not avatar_url:
+        avatar_url = f"{request.url_for('client_profile_avatar_png')}?device_id={quote(device_id)}"
+    return {
+        "status": True,
+        "data": {
+            "display_name": display_name,
+            "username": display_name,
+            "guest_id": guest_id,
+            "device_id": device_id,
+            "profile_pic_png": avatar_url,
+            "avatar_url": avatar_url,
+            "is_guest": True,
+            "raw_user": user,
+            "upstream": upstream or {},
+        },
+    }
+
+
+def png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+def generated_avatar_png(seed: str, size: int = 192) -> bytes:
+    digest = zlib.crc32(seed.encode("utf-8"))
+    base = (
+        80 + digest % 120,
+        70 + (digest >> 8) % 120,
+        95 + (digest >> 16) % 110,
+    )
+    accent = (
+        min(255, base[0] + 36),
+        min(255, base[1] + 28),
+        min(255, base[2] + 48),
+    )
+    rows = []
+    center = (size - 1) / 2
+    radius = size * 0.38
+    for y in range(size):
+        row = bytearray([0])
+        for x in range(size):
+            distance = ((x - center) ** 2 + (y - center) ** 2) ** 0.5
+            if distance <= radius:
+                mix = max(0.0, 1.0 - distance / radius)
+                color = tuple(int(base[i] * (1 - mix) + accent[i] * mix) for i in range(3))
+            else:
+                color = (18, 16, 21)
+            row.extend((*color, 255))
+        rows.append(bytes(row))
+    raw = b"".join(rows)
+    stream = io.BytesIO()
+    stream.write(b"\x89PNG\r\n\x1a\n")
+    stream.write(png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)))
+    stream.write(png_chunk(b"IDAT", zlib.compress(raw, 9)))
+    stream.write(png_chunk(b"IEND", b""))
+    return stream.getvalue()
 
 
 async def engagement_state(device_id: str) -> dict[str, set[Any]]:
@@ -494,11 +571,27 @@ async def client_auth_device(_: DeviceAuthRequest, request: Request) -> dict[str
 
 
 @router.get("/client/me", tags=["User"], summary="Get current device user", dependencies=DEVICE_AUTH)
-async def client_me(request: Request) -> Response:
+async def client_me(request: Request) -> JSONResponse:
     device_id = await extract_device_id(request)
     session = await get_device_session(device_id)
     user = session.get("user") if isinstance(session.get("user"), dict) else {}
-    return await proxy_request(request, "app", "api/user/get_info", {"auth_id": user.get("id")})
+    upstream = await optional_proxy_json(request, "app", "api/user/get_info", {"auth_id": user.get("id")})
+    upstream_user = upstream.get("data") if isinstance(upstream.get("data"), dict) else {}
+    merged_user = {**user, **upstream_user}
+    return JSONResponse(profile_payload(request, device_id, merged_user, upstream))
+
+
+@router.get("/client/me/avatar.png", tags=["User"], summary="Generated current user avatar PNG")
+async def client_profile_avatar_png(request: Request) -> Response:
+    device_id = await extract_device_id(request)
+    session = await get_device_session(device_id)
+    user = session.get("user") if isinstance(session.get("user"), dict) else {}
+    seed = first_string(user, "id", "user_id", "uid", "auth_id", "guest_id") or device_id
+    return Response(
+        content=generated_avatar_png(seed),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @router.post(
